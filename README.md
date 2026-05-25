@@ -1,0 +1,1 @@
+# shitmail-jmap-filter
