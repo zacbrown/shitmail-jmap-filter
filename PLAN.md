@@ -49,10 +49,14 @@ because they change the dependency footprint or the failure semantics.
    periodically — zero runtime deps; (b) add `tldts` or `psl` as a
    dependency. Plan uses option (a) to keep the deps list to
    `jmap-js` + `eventsource` only.
-5. **Fail-open vs fail-closed.** When DKIM is absent, or RDAP times out,
-   or the TLD has no RDAP server, what do we do? Plan defaults to
-   **fail-open** (leave in Inbox, log a warning) so a flaky RDAP server
-   can't bury legitimate mail. Configurable via env var.
+5. **Failure modes (per user direction).**
+   - **No verified DKIM → quarantine.** Treated as suspicious.
+   - **RDAP lookup failure (timeout, no registry, malformed) → defer,
+     don't decide.** The message stays in Inbox and its id is appended
+     to a persistent retry queue; a background poller re-attempts the
+     RDAP lookup on a schedule (see §10). Only once age is known is
+     the move/keep decision made. If the user has manually moved the
+     message out of Inbox in the meantime, the retry is dropped.
 6. **What counts as "in Inbox"?** Plan scopes to messages whose
    `mailboxIds` contain the Inbox mailbox ID *and* that are unread on
    first arrival (so we don't re-process mail the user has already
@@ -115,6 +119,7 @@ src/
     psl.js              eTLD+1 from vendored Public Suffix List
     rdap.js             RDAP bootstrap + lookup + age computation
     cache.js            on-disk JSON cache w/ TTL (negative + positive)
+  retry.js              persistent deferred-validation queue + poller
   state.js              persist last JMAP state string to /data
   policy.js             "younger than N days?" decision
 data/
@@ -135,7 +140,8 @@ README.md
 1. **Boot.**
    - Read `FASTMAIL_API_TOKEN`, optional `QUARANTINE_MAILBOX_NAME`
      (default `quarantine`), `MAX_DOMAIN_AGE_DAYS` (default `365`),
-     `FAIL_OPEN` (default `true`), `STATE_DIR` (default `/data`).
+     `RETRY_INTERVAL_MIN` (default `15`), `RETRY_MAX_ATTEMPTS`
+     (default `32`, ~8h with backoff), `STATE_DIR` (default `/data`).
    - Discover JMAP session: `GET https://api.fastmail.com/jmap/session`
      with `Authorization: Bearer <token>`. Extract `apiUrl`,
      `eventSourceUrl`, primary `urn:ietf:params:jmap:mail` account id.
@@ -168,10 +174,14 @@ README.md
       Pick DKIM signatures with `dkim=pass` and an aligned or
       explicit `header.d=` value. If multiple pass, prefer one
       aligned with `From:` domain; otherwise take the first.
-   4. If no passing DKIM → policy: fail-open log + leave; or quarantine
-      if `QUARANTINE_UNSIGNED=true`.
+   4. If no passing DKIM → quarantine immediately, log
+      `email.moved reason=unsigned`. Done.
    5. Compute eTLD+1 of `header.d` via PSL.
    6. Look up domain age via cache → RDAP.
+      - On cache/RDAP success: continue.
+      - On RDAP failure or `unknown` TLD: enqueue the message in the
+        retry queue (§10) with `attempts=0, nextAttempt=now+interval`,
+        log `email.deferred`. Leave the message in Inbox. Done.
    7. If age < `MAX_DOMAIN_AGE_DAYS` → `Email/set` with
       `update: { <id>: { mailboxIds: { <quarantineId>: true, <inboxId>: null } } }`.
    8. Log a structured line with: message id, from, dkim domain,
@@ -216,35 +226,79 @@ servers' A-R chained).
     `Accept: application/rdap+json`, 10s timeout.
   - Pull `events[]` where `eventAction == "registration"` →
     `eventDate`. Compute age in days vs `Date.now()`.
-- TLDs with no RDAP base (rare, mostly obscure ccTLDs) → return
-  `unknown`. Policy treats `unknown` per `FAIL_OPEN`.
+- TLDs with no RDAP base (rare, mostly obscure ccTLDs) → throw
+  `RdapUnknownTldError`. Caller enqueues for deferred retry rather
+  than making a decision.
+- All other RDAP failures (timeout, 5xx, malformed JSON) throw
+  `RdapLookupError`. Same handling.
 
 ## 9. Policy (`policy.js`)
 
-Single pure function:
+Single pure function. With unsigned-quarantine and deferred-on-unknown
+decided up-front, the policy is trivial:
 
 ```js
-shouldQuarantine({ ageDays, hasVerifiedDkim }, { maxAgeDays, failOpen, quarantineUnsigned }) -> boolean
+shouldQuarantine({ ageDays }, { maxAgeDays }) -> boolean
 ```
 
-- No verified DKIM → `quarantineUnsigned`.
-- Age unknown → `!failOpen`.
-- Age < maxAgeDays → `true`.
-- Else `false`.
+- `ageDays < maxAgeDays` → `true`.
+- Else → `false`.
 
-Unit-tested exhaustively. All other code stays free of policy
-branching.
+Callers are responsible for never invoking this with an unknown age
+(the retry queue handles those) or without a verified DKIM (handled
+inline in step 4 of §6).
 
-## 10. Logging (`log.js`)
+## 10. Deferred validation queue (`retry.js`)
+
+Purpose: when RDAP can't answer right now, we don't want to lose the
+message or guess. Instead, defer the decision and retry later.
+
+Storage:
+- `/data/retry-queue.json`, written atomically (write to `.tmp` then
+  `rename`).
+- Schema: `[{ id, registrableDomain, firstSeenAt, attempts, nextAttemptAt, lastError }]`.
+
+Scheduler:
+- A single `setInterval` ticking every `RETRY_INTERVAL_MIN` minutes
+  (default 15).
+- On each tick: for every entry with `nextAttemptAt <= now`:
+  1. `Email/get` the message — if it's no longer in Inbox (user moved
+     or deleted it), drop the entry and log `retry.dropped reason=moved`.
+  2. Re-attempt RDAP for `registrableDomain` (cache may have warmed
+     in the meantime).
+  3. On success: run the policy, move or keep, drop the entry, log
+     `retry.resolved`.
+  4. On failure: `attempts++`, set
+     `nextAttemptAt = now + min(RETRY_INTERVAL_MIN * 2^attempts, 6h)`
+     capped, save. Log `retry.backoff`.
+  5. If `attempts >= RETRY_MAX_ATTEMPTS`: drop entry, log
+     `retry.exhausted` at WARN. The message stays in Inbox; the
+     operator can grep stdout for `retry.exhausted` to find
+     undecidable mail and act manually.
+
+Boot behavior:
+- On startup, load the queue and resume the schedule. Entries whose
+  `nextAttemptAt` is already past run on the next tick.
+
+Concurrency:
+- Retry tick and the main push handler share the same single-worker
+  async queue, so we never race two `Email/set` calls on the same id.
+
+Tests:
+- Unit tests for: enqueue, drop-on-moved, backoff growth, cap,
+  exhaustion. JMAP and RDAP mocked.
+
+## 11. Logging (`log.js`)
 
 - JSON line per event: `{ ts, level, event, ...fields }`.
 - Events: `boot`, `mailbox.created`, `push.connected`,
   `push.disconnected`, `push.event`, `email.skip`,
-  `email.evaluated`, `email.moved`, `rdap.lookup`, `rdap.error`,
-  `state.persisted`, `shutdown`.
+  `email.evaluated`, `email.moved`, `email.deferred`,
+  `rdap.lookup`, `rdap.error`, `retry.resolved`, `retry.backoff`,
+  `retry.dropped`, `retry.exhausted`, `state.persisted`, `shutdown`.
 - No log library; ~30 lines of code.
 
-## 11. Containerization
+## 12. Containerization
 
 `Dockerfile` (multi-stage, ~25 lines):
 
@@ -267,7 +321,7 @@ CMD ["node", "src/index.js"]
 
 `.dockerignore` excludes `test/`, `.git/`, `node_modules/`.
 
-## 12. fly.io deploy
+## 13. fly.io deploy
 
 `fly.toml`:
 
@@ -309,7 +363,7 @@ primary_region = "sea"
 - `fly volumes create data --size 1 --region sea` for the state volume.
 - `fly deploy`.
 
-## 13. Test plan
+## 14. Test plan
 
 Unit:
 - `dkim.js` against fixture A-R headers.
@@ -318,6 +372,8 @@ Unit:
 - `rdap.js` with `fetch` mocked (success, 404, timeout,
   bootstrap-missing TLD).
 - `cache.js` TTL + persistence round-trip.
+- `retry.js` enqueue, backoff growth, cap, drop-on-moved,
+  exhaustion, queue persistence round-trip.
 
 Integration (local, no Fastmail required):
 - Stub JMAP server (small Express-like handler using Node's `http`
@@ -330,7 +386,7 @@ Manual smoke test against Fastmail:
   message from a freshly-registered domain, verify it lands in
   quarantine and the log line shows the right age.
 
-## 14. Milestones
+## 15. Milestones
 
 1. **M1 — scaffolding (½ day).** Repo layout, `package.json`,
    logger, config loader, Dockerfile, fly.toml, healthz.
@@ -343,21 +399,29 @@ Manual smoke test against Fastmail:
 4. **M4 — DKIM parsing (½ day).** Module + fixtures + tests.
 5. **M5 — domain age (1 day).** PSL vendor, RDAP bootstrap, lookup,
    cache, tests.
-6. **M6 — policy + wiring (½ day).** Glue, logs, integration test
+6. **M6 — retry queue (½ day).** Persistent queue, poller, backoff,
+   tests.
+7. **M7 — policy + wiring (½ day).** Glue, logs, integration test
    against stub JMAP server.
-7. **M7 — deploy (½ day).** Fly secrets, volume, deploy, watch logs
-   for a day on real inbox, tune `FAIL_OPEN` / `QUARANTINE_UNSIGNED`
-   defaults.
+8. **M8 — deploy (½ day).** Fly secrets, volume, deploy, watch logs
+   for a day on real inbox.
 
-Total: ~4–5 working days.
+Total: ~5 working days.
 
-## 15. Open questions for the user
+## 16. Resolved decisions
 
-1. OK to keep `eventsource` as a second runtime dep, or do you want me
-   to hand-roll an SSE reader on `fetch`'s ReadableStream?
-2. What's your preferred behavior for **unsigned / DKIM-failing
-   senders** — leave in Inbox (current default) or quarantine?
-3. RDAP can't answer for every TLD. For an `unknown` age, fail-open
-   (leave in Inbox) or fail-closed (quarantine)?
-4. Should the worker also act on **existing** mail in the Inbox at
-   first boot, or only on mail arriving *after* deploy?
+Settled during planning with the user:
+- **JMAP client:** keep `jmap-js` per original requirement.
+- **Unsigned / no passing DKIM:** quarantine immediately.
+- **RDAP age unknown:** never guess — defer the decision and retry
+  later via the persistent retry queue (§10); after
+  `RETRY_MAX_ATTEMPTS`, log `retry.exhausted` and leave in Inbox.
+- **Cold start:** only act on mail arriving after the worker starts;
+  seed JMAP state from boot time.
+
+## 17. Still open
+
+1. OK to keep `eventsource` as a second runtime dep, or hand-roll an
+   SSE reader on `fetch`'s ReadableStream?
+2. Default `RETRY_INTERVAL_MIN=15` and `RETRY_MAX_ATTEMPTS=32` (≈8h
+   with backoff cap of 6h) — happy with those?
