@@ -1,0 +1,9 @@
+target/
+.git/
+tests/
+.gitignore
+.dockerignore
+README.md
+PLAN.md
+LICENSE
+fly.toml

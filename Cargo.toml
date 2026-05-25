@@ -1,0 +1,22 @@
+[package]
+name = "shitmail-jmap-filter"
+version = "0.1.0"
+edition = "2021"
+description = "JMAP worker that quarantines mail from young DKIM-verified domains"
+license = "MIT"
+publish = false
+
+[dependencies]
+jmap-client = { version = "0.4", default-features = false, features = ["async"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs", "sync", "time", "net", "io-util"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures-util = "0.3"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+anyhow = "1"
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1

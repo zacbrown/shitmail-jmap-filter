@@ -1,0 +1,32 @@
+app = "shitmail-jmap-filter"
+primary_region = "sea"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  STATE_DIR = "/data"
+  PSL_PATH = "/opt/shitmail-jmap-filter/public_suffix_list.dat"
+  HEALTHZ_PORT = "8080"
+
+[[mounts]]
+  source = "data"
+  destination = "/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+
+[deploy]
+  strategy = "immediate"
+
+[[services]]
+  internal_port = 8080
+  protocol = "tcp"
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[services.tcp_checks]]
+    interval = "30s"
+    timeout = "5s"
